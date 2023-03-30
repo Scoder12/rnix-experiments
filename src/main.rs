@@ -7,14 +7,23 @@ use std::collections::HashMap;
 enum NixObject {
     Set(NixSet),
     Nixpkg(String),
+    FormatFactory { format_type: String },
 }
 
 impl NixObject {
-    fn try_into_set(self) -> Option<NixSet> {
+    fn try_into_set(self) -> color_eyre::Result<NixSet> {
         match self {
-            Self::Set(s) => Some(s),
-            NixObject::Nixpkg(_) => None,
+            Self::Set(s) => Ok(s),
+            Self::Nixpkg(pkg) => Err(eyre!("nixpkg '{}' cannot be treated as set", pkg)),
+            Self::FormatFactory { format_type } => Err(eyre!(
+                "'{}' format factory cannot be treated as set",
+                format_type
+            )),
         }
+    }
+
+    fn apply(self, arg: NixObject) -> color_eyre::Result<NixObject> {
+        Err(eyre!("cannot apply lambda of type {:#?}", self))
     }
 }
 
@@ -26,6 +35,7 @@ enum NixSet {
     Nixpkgs,
     Config,
     ConfigVal(Vec<String>),
+    PkgsFormats,
 }
 
 static CALLPACKAGE_ARGS: phf::Map<&'static str, NixSet> = phf_map! {
@@ -36,6 +46,13 @@ static CALLPACKAGE_ARGS: phf::Map<&'static str, NixSet> = phf_map! {
 
 static LIB: phf::Map<&'static str, NixSet> = phf_map! {};
 
+fn lookup_nixpkg(name: &str) -> NixObject {
+    if name == "formats" {
+        return NixObject::Set(NixSet::PkgsFormats);
+    }
+    NixObject::Nixpkg(name.to_owned())
+}
+
 impl NixSet {
     fn lookup(&self, k: &str) -> Option<NixObject> {
         let h = |m: &phf::Map<&'static str, NixSet>| m.get(k).map(|v| NixObject::Set(v.clone()));
@@ -43,7 +60,7 @@ impl NixSet {
             Self::Dyn(s) => s.get(k).cloned(),
             Self::CallpkgArgs => h(&CALLPACKAGE_ARGS),
             Self::Lib => h(&LIB),
-            Self::Nixpkgs => Some(NixObject::Nixpkg(k.to_owned())),
+            Self::Nixpkgs => Some(lookup_nixpkg(k)),
             Self::Config => Some(NixObject::Set(NixSet::ConfigVal(vec![k.to_owned()]))),
             Self::ConfigVal(path) => Some(NixObject::Set(NixSet::ConfigVal(
                 path.iter()
@@ -51,6 +68,10 @@ impl NixSet {
                     .chain(std::iter::once(k.to_owned()))
                     .collect(),
             ))),
+            // https://github.com/NixOS/nixpkgs/blob/master/pkgs/pkgs-lib/formats.nix
+            Self::PkgsFormats => Some(NixObject::FormatFactory {
+                format_type: k.to_owned(),
+            }),
         }
     }
 }
@@ -113,16 +134,14 @@ fn eval_object(scope: &Scope, expr: Expr) -> color_eyre::Result<NixObject> {
             let mut new_scope = scope.clone();
             let old_items = std::mem::replace(&mut new_scope.items, HashMap::new());
             new_scope.with_namespaces.push(NixSet::Dyn(old_items));
-            new_scope.with_namespaces.push(
-                eval_object(scope, namespace)?
-                    .try_into_set()
-                    .ok_or(eyre!("expected with namespace to be a set"))?,
-            );
+            new_scope
+                .with_namespaces
+                .push(eval_object(scope, namespace)?.try_into_set()?);
             eval_object(&new_scope, with.body().ok_or(eyre!("with has no body"))?)
         }
         Expr::LetIn(letin) => {
             let mut new_scope = scope.clone();
-            for entry in letin.entries() {
+            for entry in letin.entries().into_iter() {
                 match entry {
                     Entry::AttrpathValue(attrval) => {
                         let attrs = attrval
@@ -152,6 +171,43 @@ fn eval_object(scope: &Scope, expr: Expr) -> color_eyre::Result<NixObject> {
             eval_object(scope, letin.body().ok_or(eyre!("letin without body"))?)
         }
         Expr::AttrSet(set) => {
+            let is_rec = set.rec_token().is_some();
+            let mut new_scope = scope.clone();
+            let mut set_vals = HashMap::<String, NixObject>::new();
+            for entry in set.entries().into_iter() {
+                println!("{:#?}", entry);
+                match entry {
+                    Entry::AttrpathValue(attrval) => {
+                        let val = eval_object(
+                            &new_scope,
+                            attrval.value().ok_or(eyre!("set entry without value"))?,
+                        )?;
+                        let entry: Option<
+                            std::collections::hash_map::Entry<'_, String, NixObject>,
+                        > = None;
+                        for attr in attrval
+                            .attrpath()
+                            .ok_or(eyre!("set entry without attrpath"))?
+                            .attrs()
+                            .into_iter()
+                        {
+                            let Attr::Ident(attr_ident) = attr else {
+                                return Err(eyre!("unimplemented"));
+                            };
+                            let attr_ident = attr_ident.to_string();
+                            entry = match entry {
+                                None => Some(set_vals.entry(attr_ident)),
+                                Some(entry) => {
+                                    let NixObject::Set(s) = entry.or_insert_with(|| NixObject::Set(NixSet::Dyn(HashMap::new()))) else {
+                                        return Err(eyre!("cannot access attributes of non-set value"));
+                                    };
+                                }
+                            };
+                        }
+                    }
+                    _ => todo!(),
+                }
+            }
             todo!();
         }
         Expr::Ident(ident) => scope
@@ -166,13 +222,19 @@ fn eval_object(scope: &Scope, expr: Expr) -> color_eyre::Result<NixObject> {
                 .into_iter()
                 .try_fold::<_, _, color_eyre::Result<_>>(initial, |prev, attr| match attr {
                     Attr::Ident(i) => prev
-                        .try_into_set()
-                        .ok_or(eyre!("attempt to read attribute {} of non-set", i))?
+                        .clone()
+                        .try_into_set()?
                         .lookup(i.to_string().as_ref())
                         .ok_or(eyre!("value not in scope: {}", i)),
                     Attr::Dynamic(_) => todo!(),
                     Attr::Str(_) => todo!(),
                 })
+        }
+        Expr::Apply(a) => {
+            let lambda = eval_object(scope, a.lambda().ok_or(eyre!("apply without lambda"))?)?;
+            let argument =
+                eval_object(scope, a.argument().ok_or(eyre!("apply without argument"))?)?;
+            lambda.apply(argument)
         }
         expr => return Err(eyre!("cannot eval object of type: {}", token_type(&expr))),
     }
