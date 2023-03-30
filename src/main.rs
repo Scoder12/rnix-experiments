@@ -1,6 +1,20 @@
 use eyre::eyre;
+use phf::phf_map;
 use rnix::ast::{Attr, AttrSet, Entry, Expr, HasEntry, Param};
 use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+enum NixObject {
+    Set(HashMap<String, NixObject>),
+    CallpkgArgs,
+    Lib,
+    Nixpkgs,
+}
+
+static CALLPACKAGE_ARGS: phf::Map<&'static str, NixObject> = phf_map! {
+    "lib" => NixObject::Lib,
+    "pkgs" => NixObject::Nixpkgs,
+};
 
 fn proc_main_set(scope: &mut HashMap<String, String>, set: AttrSet) {
     println!("{set:#?}");
@@ -41,7 +55,7 @@ fn main() -> color_eyre::Result<()> {
         return Err(eyre!("file does not contain a lambda"));
     };
 
-    let mut scope: HashMap<String, String> = HashMap::new();
+    let mut scope: HashMap<String, NixObject> = HashMap::new();
     let param = lambda
         .param()
         .ok_or(eyre!("top-level lambda does not have a param"))?;
@@ -51,7 +65,7 @@ fn main() -> color_eyre::Result<()> {
     if let Some(bind) = pat.pat_bind() {
         scope.insert(
             bind.ident().ok_or(eyre!("bind without ident"))?.to_string(),
-            "callPackage".to_string(),
+            NixObject::CallpkgArgs,
         );
     }
     for e in pat.pat_entries() {
@@ -60,7 +74,13 @@ fn main() -> color_eyre::Result<()> {
             .ok_or(eyre!("pat entry without ident"))?
             .to_string();
         let val = format!("callPackage.{}", &ident);
-        scope.insert(ident, val);
+        scope.insert(
+            ident,
+            CALLPACKAGE_ARGS
+                .get(&ident)
+                .ok_or(eyre!("unknown callPackage arg {}", ident))?
+                .clone(),
+        );
     }
 
     let mut body = lambda.body().ok_or(eyre!("lambda without body"))?;
@@ -72,7 +92,7 @@ fn main() -> color_eyre::Result<()> {
             else {
                 return Err(eyre!("unexpected with namespace type"));
             };
-                scope.insert(format!("{}.*", namespace.to_string()), "".to_owned());
+                scope.extend(todo!());
                 body = with.body().ok_or(eyre!("with has no body"))?;
             }
             Expr::LetIn(letin) => {
@@ -91,10 +111,10 @@ fn main() -> color_eyre::Result<()> {
                                 ));
                             }
                             let Attr::Ident(ident) = attrs.first().unwrap() else {
-                                return Err(eyre!("unexpect let attr type"));
+                                return Err(eyre!("unexpected let attr type"));
                             };
-                            let val = attrval.value();
-                            todo!();
+                            let val = attrval.value().ok_or(eyre!("let binding without value"))?;
+                            scope.insert(ident.to_string(), token_type(&val).to_owned());
                         }
                         Entry::Inherit(inherit) => {
                             todo!();
