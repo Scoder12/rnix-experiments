@@ -1,23 +1,84 @@
 use eyre::eyre;
 use phf::phf_map;
-use rnix::ast::{Attr, AttrSet, Entry, Expr, HasEntry, Param};
+use rnix::ast::{Attr, Attrpath, Entry, Expr, HasEntry, Param};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 enum NixObject {
-    Set(HashMap<String, NixObject>),
+    Set(NixSet),
+    Nixpkg(String),
+}
+
+impl NixObject {
+    fn try_into_set(self) -> Option<NixSet> {
+        match self {
+            Self::Set(s) => Some(s),
+            NixObject::Nixpkg(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NixSet {
+    Dyn(HashMap<String, NixObject>),
     CallpkgArgs,
     Lib,
     Nixpkgs,
+    Config,
+    ConfigVal(Vec<String>),
 }
 
-static CALLPACKAGE_ARGS: phf::Map<&'static str, NixObject> = phf_map! {
-    "lib" => NixObject::Lib,
-    "pkgs" => NixObject::Nixpkgs,
+static CALLPACKAGE_ARGS: phf::Map<&'static str, NixSet> = phf_map! {
+    "lib" => NixSet::Lib,
+    "pkgs" => NixSet::Nixpkgs,
+    "config" => NixSet::Config,
 };
 
-fn proc_main_set(scope: &mut HashMap<String, String>, set: AttrSet) {
-    println!("{set:#?}");
+static LIB: phf::Map<&'static str, NixSet> = phf_map! {};
+
+impl NixSet {
+    fn lookup(&self, k: &str) -> Option<NixObject> {
+        let h = |m: &phf::Map<&'static str, NixSet>| m.get(k).map(|v| NixObject::Set(v.clone()));
+        match self {
+            Self::Dyn(s) => s.get(k).cloned(),
+            Self::CallpkgArgs => h(&CALLPACKAGE_ARGS),
+            Self::Lib => h(&LIB),
+            Self::Nixpkgs => Some(NixObject::Nixpkg(k.to_owned())),
+            Self::Config => Some(NixObject::Set(NixSet::ConfigVal(vec![k.to_owned()]))),
+            Self::ConfigVal(path) => Some(NixObject::Set(NixSet::ConfigVal(
+                path.iter()
+                    .cloned()
+                    .chain(std::iter::once(k.to_owned()))
+                    .collect(),
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Scope {
+    items: HashMap<String, NixObject>,
+    with_namespaces: Vec<NixSet>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    // We handle precedence of items vs. with by promoting items itno a with_namespaces
+    //  entry every time a new with_namespace is added.
+    fn lookup(&self, k: &str) -> Option<NixObject> {
+        if let Some(obj) = self.items.get(k) {
+            return Some(obj.clone());
+        }
+        for namespace in self.with_namespaces.iter() {
+            if let Some(obj) = namespace.lookup(k) {
+                return Some(obj);
+            }
+        }
+        None
+    }
 }
 
 fn token_type(expr: &Expr) -> &'static str {
@@ -45,6 +106,78 @@ fn token_type(expr: &Expr) -> &'static str {
     }
 }
 
+fn eval_object(scope: &Scope, expr: Expr) -> color_eyre::Result<NixObject> {
+    match expr {
+        Expr::With(with) => {
+            let namespace = with.namespace().ok_or(eyre!("with has no namespace"))?;
+            let mut new_scope = scope.clone();
+            let old_items = std::mem::replace(&mut new_scope.items, HashMap::new());
+            new_scope.with_namespaces.push(NixSet::Dyn(old_items));
+            new_scope.with_namespaces.push(
+                eval_object(scope, namespace)?
+                    .try_into_set()
+                    .ok_or(eyre!("expected with namespace to be a set"))?,
+            );
+            eval_object(&new_scope, with.body().ok_or(eyre!("with has no body"))?)
+        }
+        Expr::LetIn(letin) => {
+            let mut new_scope = scope.clone();
+            for entry in letin.entries() {
+                match entry {
+                    Entry::AttrpathValue(attrval) => {
+                        let attrs = attrval
+                            .attrpath()
+                            .ok_or(eyre!("let entry without attrpath"))?
+                            .attrs()
+                            .collect::<Vec<_>>();
+                        if attrs.len() != 1 {
+                            return Err(eyre!(
+                                "expect single attr in let attrpath, found {}",
+                                attrs.len()
+                            ));
+                        }
+                        let Attr::Ident(ident) = attrs.first().unwrap() else {
+                            return Err(eyre!("unexpected let attr type"));
+                        };
+                        let val = attrval.value().ok_or(eyre!("let binding without value"))?;
+                        new_scope
+                            .items
+                            .insert(ident.to_string(), eval_object(&new_scope, val)?);
+                    }
+                    Entry::Inherit(inherit) => {
+                        todo!();
+                    }
+                }
+            }
+            eval_object(scope, letin.body().ok_or(eyre!("letin without body"))?)
+        }
+        Expr::AttrSet(set) => {
+            todo!();
+        }
+        Expr::Ident(ident) => scope
+            .lookup(ident.to_string().as_ref())
+            .ok_or(eyre!("value not in scope: {}", ident)),
+        Expr::Select(s) => {
+            println!("{:#?}", s);
+            let initial = eval_object(scope, s.expr().ok_or(eyre!("select without expr"))?)?;
+            s.attrpath()
+                .ok_or(eyre!("select without attrpath"))?
+                .attrs()
+                .into_iter()
+                .try_fold::<_, _, color_eyre::Result<_>>(initial, |prev, attr| match attr {
+                    Attr::Ident(i) => prev
+                        .try_into_set()
+                        .ok_or(eyre!("attempt to read attribute {} of non-set", i))?
+                        .lookup(i.to_string().as_ref())
+                        .ok_or(eyre!("value not in scope: {}", i)),
+                    Attr::Dynamic(_) => todo!(),
+                    Attr::Str(_) => todo!(),
+                })
+        }
+        expr => return Err(eyre!("cannot eval object of type: {}", token_type(&expr))),
+    }
+}
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
@@ -55,7 +188,7 @@ fn main() -> color_eyre::Result<()> {
         return Err(eyre!("file does not contain a lambda"));
     };
 
-    let mut scope: HashMap<String, NixObject> = HashMap::new();
+    let mut scope = Scope::new();
     let param = lambda
         .param()
         .ok_or(eyre!("top-level lambda does not have a param"))?;
@@ -63,9 +196,9 @@ fn main() -> color_eyre::Result<()> {
         return Err(eyre!("top-level lambda does not destructure its argument"));
     };
     if let Some(bind) = pat.pat_bind() {
-        scope.insert(
+        scope.items.insert(
             bind.ident().ok_or(eyre!("bind without ident"))?.to_string(),
-            NixObject::CallpkgArgs,
+            NixObject::Set(NixSet::CallpkgArgs),
         );
     }
     for e in pat.pat_entries() {
@@ -73,64 +206,16 @@ fn main() -> color_eyre::Result<()> {
             .ident()
             .ok_or(eyre!("pat entry without ident"))?
             .to_string();
-        let val = format!("callPackage.{}", &ident);
-        scope.insert(
-            ident,
+        let val = NixObject::Set(
             CALLPACKAGE_ARGS
                 .get(&ident)
-                .ok_or(eyre!("unknown callPackage arg {}", ident))?
+                .ok_or(eyre!("unknown callPackage arg: {}", ident))?
                 .clone(),
         );
+        scope.items.insert(ident, val);
     }
 
-    let mut body = lambda.body().ok_or(eyre!("lambda without body"))?;
-    loop {
-        match body {
-            Expr::With(with) => {
-                let Expr::Ident(namespace) =
-                with.namespace().ok_or(eyre!("with has no namespace"))?
-            else {
-                return Err(eyre!("unexpected with namespace type"));
-            };
-                scope.extend(todo!());
-                body = with.body().ok_or(eyre!("with has no body"))?;
-            }
-            Expr::LetIn(letin) => {
-                for entry in letin.entries() {
-                    match entry {
-                        Entry::AttrpathValue(attrval) => {
-                            let attrs = attrval
-                                .attrpath()
-                                .ok_or(eyre!("let entry without attrpath"))?
-                                .attrs()
-                                .collect::<Vec<_>>();
-                            if attrs.len() != 1 {
-                                return Err(eyre!(
-                                    "expect single attr in let attrpath, found {}",
-                                    attrs.len()
-                                ));
-                            }
-                            let Attr::Ident(ident) = attrs.first().unwrap() else {
-                                return Err(eyre!("unexpected let attr type"));
-                            };
-                            let val = attrval.value().ok_or(eyre!("let binding without value"))?;
-                            scope.insert(ident.to_string(), token_type(&val).to_owned());
-                        }
-                        Entry::Inherit(inherit) => {
-                            todo!();
-                        }
-                    }
-                }
-                body = letin.body().ok_or(eyre!("letin without body"))?;
-            }
-            Expr::AttrSet(set) => {
-                proc_main_set(&mut scope, set);
-                break;
-            }
-            _ => return Err(eyre!("unexpected lambda return type {:#?}", body)),
-        }
-    }
-
-    println!("{:#?}", scope);
+    let body = lambda.body().ok_or(eyre!("lambda without body"))?;
+    eval_object(&scope, body)?;
     Ok(())
 }
